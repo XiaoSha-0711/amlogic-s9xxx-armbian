@@ -1,0 +1,94 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: XiaoSha <75024098+XiaoSha-0711@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 19:09:08 +0000
+Subject: [PATCH 2/2] drm/rockchip: dw_hdmi: support rockchip,phy-table from
+ the vendor kernel
+
+Vendor device trees tune the Synopsys HDMI PHY per board with a
+"rockchip,phy-table" property of <pixelclock sym_ctr term vlev_ctr>
+entries. Port its parsing so boards with long or weak HDMI traces can
+use the same signal settings as their vendor firmware.
+---
+ drivers/gpu/drm/rockchip/dw_hdmi-rockchip.c | 62 +++++++++++++++++++++
+ 1 file changed, 62 insertions(+)
+
+diff --git a/drivers/gpu/drm/rockchip/dw_hdmi-rockchip.c b/drivers/gpu/drm/rockchip/dw_hdmi-rockchip.c
+index ed019abb6..322d4092e 100644
+--- a/drivers/gpu/drm/rockchip/dw_hdmi-rockchip.c
++++ b/drivers/gpu/drm/rockchip/dw_hdmi-rockchip.c
+@@ -548,6 +548,64 @@ static const struct of_device_id dw_hdmi_rockchip_dt_ids[] = {
+ };
+ MODULE_DEVICE_TABLE(of, dw_hdmi_rockchip_dt_ids);
+ 
++/*
++ * Board specific Synopsys PHY settings, ported from the Rockchip vendor
++ * kernel. "rockchip,phy-table" holds <pixelclock sym_ctr term vlev_ctr>
++ * quadruplets, a pixelclock of 0 meaning "all remaining rates".
++ */
++static int dw_hdmi_rockchip_parse_phy_table(struct device *dev,
++					    struct drm_device *drm,
++					    struct dw_hdmi_plat_data *plat_data)
++{
++	struct dw_hdmi_phy_config *phy_config;
++	int count, entries, i, ret;
++	u32 *table;
++
++	count = of_property_count_u32_elems(dev->of_node, "rockchip,phy-table");
++	if (count == -EINVAL)
++		return 0;
++
++	if (!plat_data->phy_config) {
++		dev_warn(dev, "rockchip,phy-table ignored, no Synopsys PHY\n");
++		return 0;
++	}
++
++	if (count <= 0 || count % 4) {
++		dev_err(dev, "invalid rockchip,phy-table\n");
++		return -EINVAL;
++	}
++
++	entries = count / 4;
++	phy_config = drmm_kcalloc(drm, entries + 1, sizeof(*phy_config),
++				  GFP_KERNEL);
++	if (!phy_config)
++		return -ENOMEM;
++
++	table = kcalloc(count, sizeof(*table), GFP_KERNEL);
++	if (!table)
++		return -ENOMEM;
++
++	ret = of_property_read_u32_array(dev->of_node, "rockchip,phy-table",
++					 table, count);
++	if (ret) {
++		kfree(table);
++		return ret;
++	}
++
++	for (i = 0; i < entries; i++) {
++		phy_config[i].mpixelclock = table[i * 4] ? table[i * 4] : ~0UL;
++		phy_config[i].sym_ctr = table[i * 4 + 1];
++		phy_config[i].term = table[i * 4 + 2];
++		phy_config[i].vlev_ctr = table[i * 4 + 3];
++	}
++	phy_config[entries].mpixelclock = ~0UL;
++	kfree(table);
++
++	plat_data->phy_config = phy_config;
++
++	return 0;
++}
++
+ static int dw_hdmi_rockchip_bind(struct device *dev, struct device *master,
+ 				 void *data)
+ {
+@@ -583,6 +641,10 @@ static int dw_hdmi_rockchip_bind(struct device *dev, struct device *master,
+ 	plat_data->priv_data = hdmi;
+ 	encoder = &hdmi->encoder.encoder;
+ 
++	ret = dw_hdmi_rockchip_parse_phy_table(dev, drm, plat_data);
++	if (ret)
++		return ret;
++
+ 	encoder->possible_crtcs = drm_of_find_possible_crtcs(drm, np);
+ 	rockchip_drm_encoder_set_crtc_endpoint_id(&hdmi->encoder,
+ 						  np, 0, 0);
