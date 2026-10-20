@@ -1,0 +1,237 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: XiaoSha <75024098+XiaoSha-0711@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 19:09:08 +0000
+Subject: [PATCH 1/2] clk: rockchip: pll: compute rk3399 pll settings for rates
+ outside the table
+
+Rockchip plls only accept rates listed in their rate table. On RK3399 the
+VPLL drives the HDMI pixel clock, so dw_hdmi-rockchip rejects every mode
+whose pixel clock is missing from rk3399_pll_rates (e.g. 241.5 MHz for
+2560x1440@60), and the display falls back to a lower resolution.
+
+Port the automatic parameter calculation of the Rockchip vendor kernel:
+for plls flagged ROCKCHIP_PLL_ALLOW_AUTO_RATE, determine_rate and set_rate
+compute an exact integer mode setting, falling back to fractional mode,
+when the requested rate is not in the table. Enable it for the RK3399
+VPLL only, so the other plls keep their validated table rates.
+---
+ drivers/clk/rockchip/clk-pll.c    | 134 ++++++++++++++++++++++++++++++
+ drivers/clk/rockchip/clk-rk3399.c |   4 +-
+ drivers/clk/rockchip/clk.h        |   3 +
+ 3 files changed, 140 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/clk/rockchip/clk-pll.c b/drivers/clk/rockchip/clk-pll.c
+index b8e1743d9..a30694913 100644
+--- a/drivers/clk/rockchip/clk-pll.c
++++ b/drivers/clk/rockchip/clk-pll.c
+@@ -15,6 +15,7 @@
+ #include <linux/iopoll.h>
+ #include <linux/math64.h>
+ #include <linux/regmap.h>
++#include <linux/units.h>
+ #include <linux/clk.h>
+ #include "clk.h"
+ 
+@@ -62,13 +63,28 @@ static const struct rockchip_pll_rate_table *rockchip_get_pll_settings(
+ 	return NULL;
+ }
+ 
++static bool rockchip_rk3399_pll_calc_params(unsigned long fin_hz,
++					    unsigned long fout_hz,
++					    struct rockchip_pll_rate_table *rate);
++
+ static int rockchip_pll_determine_rate(struct clk_hw *hw,
+ 				       struct clk_rate_request *req)
+ {
+ 	struct rockchip_clk_pll *pll = to_rockchip_clk_pll(hw);
+ 	const struct rockchip_pll_rate_table *rate_table = pll->rate_table;
++	struct rockchip_pll_rate_table auto_rate;
+ 	int i;
+ 
++	if ((pll->flags & ROCKCHIP_PLL_ALLOW_AUTO_RATE) &&
++	    pll->type == pll_rk3399 &&
++	    !rockchip_get_pll_settings(pll, req->rate) &&
++	    rockchip_rk3399_pll_calc_params(req->best_parent_rate, req->rate,
++					    &auto_rate)) {
++		req->rate = auto_rate.rate;
++
++		return 0;
++	}
++
+ 	/* Assuming rate_table is in descending order */
+ 	for (i = 0; i < pll->rate_count; i++) {
+ 		if (req->rate >= rate_table[i].rate) {
+@@ -605,6 +621,120 @@ static const struct clk_ops rockchip_rk3066_pll_clk_ops = {
+ #define RK3399_PLLCON3_DSMPD_MASK		0x1
+ #define RK3399_PLLCON3_DSMPD_SHIFT		3
+ 
++#define RK3399_PLL_FOUTVCO_MIN			(800 * HZ_PER_MHZ)
++#define RK3399_PLL_FOUTVCO_MAX			(3200 * HZ_PER_MHZ)
++#define RK3399_PLL_FREF_MIN_INT			(1 * HZ_PER_MHZ)
++#define RK3399_PLL_FREF_MIN_FRAC		(10 * HZ_PER_MHZ)
++#define RK3399_PLL_FBDIV_MIN_INT		16
++#define RK3399_PLL_FBDIV_MAX_INT		3200
++#define RK3399_PLL_FBDIV_MIN_FRAC		20
++#define RK3399_PLL_FBDIV_MAX_FRAC		320
++#define RK3399_PLL_REFDIV_MAX			63
++#define RK3399_PLL_POSTDIV_MAX			7
++
++static unsigned long rockchip_rk3399_pll_calc_rate(unsigned long fin_hz,
++				const struct rockchip_pll_rate_table *rate)
++{
++	u64 rate64 = (u64)fin_hz * rate->fbdiv;
++
++	do_div(rate64, rate->refdiv);
++
++	if (rate->dsmpd == 0) {
++		u64 frac_rate64 = (u64)fin_hz * rate->frac;
++
++		do_div(frac_rate64, rate->refdiv);
++		rate64 += frac_rate64 >> 24;
++	}
++
++	do_div(rate64, rate->postdiv1);
++	do_div(rate64, rate->postdiv2);
++
++	return (unsigned long)rate64;
++}
++
++/*
++ * Compute pll parameters for a rate missing from the rate table, following
++ * the automatic calculation of the Rockchip vendor kernel. An exact integer
++ * mode setting is preferred, fractional mode is used as a fallback. This
++ * lets e.g. the VPLL produce any HDMI pixel clock instead of only the few
++ * listed in rk3399_pll_rates.
++ */
++static bool rockchip_rk3399_pll_calc_params(unsigned long fin_hz,
++					    unsigned long fout_hz,
++					    struct rockchip_pll_rate_table *rate)
++{
++	u32 postdiv1, postdiv2, refdiv;
++	u64 foutvco, fbdiv, rem, frac;
++
++	if (!fin_hz || !fout_hz)
++		return false;
++
++	/* integer mode */
++	for (postdiv1 = 1; postdiv1 <= RK3399_PLL_POSTDIV_MAX; postdiv1++) {
++		for (postdiv2 = 1; postdiv2 <= postdiv1; postdiv2++) {
++			foutvco = (u64)fout_hz * postdiv1 * postdiv2;
++			if (foutvco < RK3399_PLL_FOUTVCO_MIN ||
++			    foutvco > RK3399_PLL_FOUTVCO_MAX)
++				continue;
++
++			for (refdiv = 1; refdiv <= RK3399_PLL_REFDIV_MAX; refdiv++) {
++				if (fin_hz / refdiv < RK3399_PLL_FREF_MIN_INT)
++					break;
++
++				fbdiv = div64_u64_rem(foutvco * refdiv, fin_hz, &rem);
++				if (rem || fbdiv < RK3399_PLL_FBDIV_MIN_INT ||
++				    fbdiv > RK3399_PLL_FBDIV_MAX_INT)
++					continue;
++
++				rate->refdiv = refdiv;
++				rate->fbdiv = fbdiv;
++				rate->postdiv1 = postdiv1;
++				rate->postdiv2 = postdiv2;
++				rate->dsmpd = 1;
++				rate->frac = 0;
++				rate->rate = rockchip_rk3399_pll_calc_rate(fin_hz, rate);
++
++				return true;
++			}
++		}
++	}
++
++	/* fractional mode, refdiv = 1 keeps fref at the 24MHz oscillator */
++	if (fin_hz < RK3399_PLL_FREF_MIN_FRAC)
++		return false;
++
++	for (postdiv1 = 1; postdiv1 <= RK3399_PLL_POSTDIV_MAX; postdiv1++) {
++		for (postdiv2 = 1; postdiv2 <= postdiv1; postdiv2++) {
++			foutvco = (u64)fout_hz * postdiv1 * postdiv2;
++			if (foutvco < RK3399_PLL_FOUTVCO_MIN ||
++			    foutvco > RK3399_PLL_FOUTVCO_MAX)
++				continue;
++
++			fbdiv = div64_u64_rem(foutvco, fin_hz, &rem);
++			frac = DIV64_U64_ROUND_CLOSEST(rem << 24, fin_hz);
++			if (frac >> 24) {
++				fbdiv++;
++				frac = 0;
++			}
++			if (fbdiv < RK3399_PLL_FBDIV_MIN_FRAC ||
++			    fbdiv > RK3399_PLL_FBDIV_MAX_FRAC)
++				continue;
++
++			rate->refdiv = 1;
++			rate->fbdiv = fbdiv;
++			rate->postdiv1 = postdiv1;
++			rate->postdiv2 = postdiv2;
++			rate->dsmpd = frac ? 0 : 1;
++			rate->frac = frac;
++			rate->rate = rockchip_rk3399_pll_calc_rate(fin_hz, rate);
++
++			return true;
++		}
++	}
++
++	return false;
++}
++
+ static int rockchip_rk3399_pll_wait_lock(struct rockchip_clk_pll *pll)
+ {
+ 	u32 pllcon;
+@@ -742,12 +872,16 @@ static int rockchip_rk3399_pll_set_rate(struct clk_hw *hw, unsigned long drate,
+ {
+ 	struct rockchip_clk_pll *pll = to_rockchip_clk_pll(hw);
+ 	const struct rockchip_pll_rate_table *rate;
++	struct rockchip_pll_rate_table auto_rate;
+ 
+ 	pr_debug("%s: changing %s to %lu with a parent rate of %lu\n",
+ 		 __func__, __clk_get_name(hw->clk), drate, prate);
+ 
+ 	/* Get required rate settings from table */
+ 	rate = rockchip_get_pll_settings(pll, drate);
++	if (!rate && (pll->flags & ROCKCHIP_PLL_ALLOW_AUTO_RATE) &&
++	    rockchip_rk3399_pll_calc_params(prate, drate, &auto_rate))
++		rate = &auto_rate;
+ 	if (!rate) {
+ 		pr_err("%s: Invalid rate : %lu for pll clk %s\n", __func__,
+ 			drate, __clk_get_name(hw->clk));
+diff --git a/drivers/clk/rockchip/clk-rk3399.c b/drivers/clk/rockchip/clk-rk3399.c
+index c2b243d7a..a4a4350ba 100644
+--- a/drivers/clk/rockchip/clk-rk3399.c
++++ b/drivers/clk/rockchip/clk-rk3399.c
+@@ -229,7 +229,9 @@ static struct rockchip_pll_clock rk3399_pll_clks[] __initdata = {
+ 	[npll] = PLL(pll_rk3399, PLL_NPLL, "npll",  mux_pll_p, 0, RK3399_PLL_CON(40),
+ 		     RK3399_PLL_CON(43), 8, 31, ROCKCHIP_PLL_SYNC_RATE, rk3399_pll_rates),
+ 	[vpll] = PLL(pll_rk3399, PLL_VPLL, "vpll",  mux_pll_p, 0, RK3399_PLL_CON(48),
+-		     RK3399_PLL_CON(51), 8, 31, ROCKCHIP_PLL_SYNC_RATE, rk3399_pll_rates),
++		     RK3399_PLL_CON(51), 8, 31,
++		     ROCKCHIP_PLL_SYNC_RATE | ROCKCHIP_PLL_ALLOW_AUTO_RATE,
++		     rk3399_pll_rates),
+ };
+ 
+ static struct rockchip_pll_clock rk3399_pmu_pll_clks[] __initdata = {
+diff --git a/drivers/clk/rockchip/clk.h b/drivers/clk/rockchip/clk.h
+index 72b36bba3..a43f531fb 100644
+--- a/drivers/clk/rockchip/clk.h
++++ b/drivers/clk/rockchip/clk.h
+@@ -662,6 +662,8 @@ struct rockchip_pll_rate_table {
+  * ROCKCHIP_PLL_SYNC_RATE - check rate parameters to match against the
+  *	rate_table parameters and adjust them if necessary.
+  * ROCKCHIP_PLL_FIXED_MODE - the pll operates in normal mode only
++ * ROCKCHIP_PLL_ALLOW_AUTO_RATE - compute pll parameters for rates that are
++ *	not part of the rate_table (rk3399-type plls only)
+  */
+ struct rockchip_pll_clock {
+ 	unsigned int		id;
+@@ -680,6 +682,7 @@ struct rockchip_pll_clock {
+ 
+ #define ROCKCHIP_PLL_SYNC_RATE		BIT(0)
+ #define ROCKCHIP_PLL_FIXED_MODE		BIT(1)
++#define ROCKCHIP_PLL_ALLOW_AUTO_RATE	BIT(2)
+ 
+ #define PLL(_type, _id, _name, _pnames, _flags, _con, _mode, _mshift,	\
+ 		_lshift, _pflags, _rtable)				\
